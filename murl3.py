@@ -1,0 +1,225 @@
+import sys
+import socket
+import argparse
+import struct
+import time
+
+class TimeoutException(Exception):
+    pass
+
+class BadDataException(Exception):
+    pass
+
+message_type_hello = 0
+message_type_heartbeat = 1
+message_type_request = 2
+message_type_response = 3
+message_type_bye = 6
+
+key_version = 'version'
+key_client_name = 'client-name'
+key_max_length = 'max-length'
+
+protocol_version = 1
+
+# standard socket operation timeout for frame exchange (like reading hello messages)
+socket_op_timeout = 3.0
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-v', '--verbose', action='store_true', help='be verbose')
+parser.add_argument('-m', '--max-length', metavar='BYTES', type=int, default=10*1024*1024, help='maximum response length allowed')
+parser.add_argument('-t', '--timeout', type=int, default=10000, help='maximum time the response is waited (ms)')
+parser.add_argument('-c', '--connect-timeout', metavar='TIMEOUT', type=int, default=3000, help='socket connection timeout (ms)')
+parser.add_argument('-a', '--attribute', dest='attributes', action='append', default=[], help="set a request attribute ('name: value')")
+parser.add_argument('host')
+parser.add_argument('port', type=int)
+parser.add_argument('message', nargs='?', help='request body to send; if empty read from standard output')
+args = parser.parse_args()
+
+def log_error(msg):
+    print(msg, file=sys.stderr)
+
+def log(msg):
+    if args.verbose:
+        print("*", end=" ", file=sys.stderr)
+        log_error(msg)
+
+def recvall(sock, length):
+    res = b""
+    remaining = length
+    while remaining > 0:
+        data = sock.recv(remaining)
+        if len(data) == 0:
+            raise EOFError()
+        remaining -= len(data)
+        res += data
+    return res
+
+def send_attributes(sock, attributes):
+    sock.send(len(attributes).to_bytes(1, byteorder='big'))
+    for (name, value) in attributes:
+        sock.sendall(len(name).to_bytes(1, byteorder='big'))
+        sock.sendall(name.encode('utf-8'))
+        sock.sendall(struct.pack('>h', len(value)))
+        sock.sendall(value.encode('utf-8'))
+
+def calc_attribute_length(attributes):
+    length = 1
+    for (name, value) in attributes:
+        length += 1
+        length += len(name)
+        length += 2
+        length += len(value)
+    return length
+
+def recv_attributes(sock):
+    length = struct.unpack('>B', recvall(sock, 1))[0]
+    res = []
+    for i in range(length):
+        len_name = struct.unpack('>B', recvall(sock, 1))[0]
+        name = recvall(sock, len_name).decode('utf-8')
+        len_value = struct.unpack('>h', recvall(sock, 2))[0]
+        value = recvall(sock, len_value).decode('utf-8')
+        res.append((name, value))
+    return res
+
+def send_client_hello(sock, max_length):
+    sock.sendall(bytes([message_type_hello]))
+    attributes = [(key_version, str(1)), (key_client_name, 'murl'), (key_max_length, str(max_length))]
+    message_length = calc_attribute_length(attributes)
+    sock.sendall(struct.pack('>i', message_length))
+    send_attributes(sock, attributes)
+    log("client hello sent: " + str(attributes))
+
+def recv_server_hello(sock):
+    message_type = recvall(sock, 1)[0]
+    if message_type != 0:
+        raise BadDataException("expected hello message, received: " + str(message_type))
+    length = struct.unpack('>i', recvall(sock, 4))[0]
+    attributes = dict(recv_attributes(sock))
+    log("received server hello message: " + str(attributes))
+    return attributes
+
+def send_request(sock, msg, timeout, attributes):
+    sock.sendall(bytes([message_type_request]))
+    attr_len = calc_attribute_length(attributes)
+    length = 4 + 4 + 4 + attr_len + len(msg)
+    sock.sendall(struct.pack('>i', length))
+    sock.sendall(struct.pack('>i', 1)) # request id
+    sock.sendall(struct.pack('>i', 0)) # flow id
+    sock.sendall(struct.pack('>i', timeout))
+    send_attributes(sock, attributes)
+    log("request attributes: " + str(attributes))
+    sock.sendall(msg.encode('utf-8'))
+    log("request sent; length: %d" % len(msg))
+
+def send_bye(sock):
+    sock.sendall(bytes([message_type_bye]))
+    length = 0
+    sock.sendall(struct.pack('>i', length))
+    log("bye sent")
+
+def send_heartbeat(sock):
+    sock.sendall(bytes([message_type_heartbeat]))
+    sock.sendall(struct.pack('>i', 0))
+    log("heart beat sent")
+
+def recv_response(sock, timeout):
+    start = time.time()
+    response_received = False
+
+    def check_timeout():
+        if (time.time() - start) * 1000 > timeout:
+            raise TimeoutException()
+
+    length = None
+    started = False
+    while not response_received:
+        try:
+            # set small timeout to give resolution to the response timeout, revert afterwards
+            sock.settimeout(0.1)
+            message_type = recvall(sock, 1)[0]
+            if not started:
+                log("server started to send response, delay %d ms" % ((time.time() - start) * 1000))
+                started = True
+            sock.settimeout(socket_op_timeout)
+            length = struct.unpack('>i', recvall(sock, 4))[0]
+            if message_type == message_type_heartbeat:
+                check_timeout()
+                log("heart beat received")
+                # take advantage of heartbeat send by server to send client's
+                send_heartbeat(sock)
+            elif message_type == message_type_response:
+                response_received = True
+            else:
+                raise BadDataException("Invalid message type. Expected response or heartbeat, received: " + str(message_type))
+        except socket.timeout:
+            # socket timeout fired, now check real response timeout
+            check_timeout()
+    ref = struct.unpack('>i', recvall(sock, 4))[0]
+    if ref != 1:
+        raise BadDataException("Invalid reference in response: %d" % ref)
+    attr = recv_attributes(sock)
+    attr_len = calc_attribute_length(attr)
+    log("response attributes: %s" % attr)
+    remaining_length = length - 4 - attr_len
+    response = recvall(sock, remaining_length).decode('utf-8')
+    log("response body received from server; length: %d" % remaining_length)
+    send_bye(sock)
+    return response
+
+def connect(sock, host, port, timeout):
+    log("resolving %s..." % host)
+    address = socket.gethostbyname(host)
+    log("connecting to %s:%s..." % (address, port))
+    # set connection timeout and revert afterwards
+    sock.settimeout(float(timeout) / 1000)
+    sock.connect((address, port))
+    sock.settimeout(socket_op_timeout)
+    local_addr = sock.getsockname()
+    remote_addr = sock.getpeername()
+    log("connected from %s:%s to %s:%s" % (local_addr[0], local_addr[1], remote_addr[0], remote_addr[1]))
+
+attributes = []
+for attr in args.attributes:
+    parts = attr.split(':', 1)
+    if len(parts) != 2:
+        log_error("invalid attribute specification: %s -- must be of the form 'name: value'" % attr)
+        sys.exit(6)
+    name, value = parts
+    attributes.append((name.strip(), value.strip()))
+
+if args.message is None:
+    message = ""
+    for line in sys.stdin:
+        message += line
+else:
+    message = args.message
+
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connect(sock, args.host, args.port, args.connect_timeout)
+    send_client_hello(sock, args.max_length)
+    server_attributes = recv_server_hello(sock)
+    max_length = int(server_attributes[key_max_length])
+    if len(message) > max_length:
+        log_error("Message (length %d) is longer than the maximum allowed by the server (%d)" % (len(message), max_length))
+        sys.exit(4)
+    send_request(sock, message, args.timeout, attributes)
+    response = recv_response(sock, args.timeout)
+    print(response)
+    sys.exit(0)
+except BadDataException as e:
+    log_error("Bad data: %s" % e)
+    sys.exit(2)
+except TimeoutException:
+    log_error("Response timed out after %d ms" % args.timeout)
+    sys.exit(3)
+except socket.timeout:
+    log_error("Socket timeout")
+    sys.exit(5)
+except EOFError:
+    log_error("EOF error")
+except IOError as e:
+    log_error("IO error: %s" % e)
+    sys.exit(1)
